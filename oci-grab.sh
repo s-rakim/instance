@@ -24,12 +24,35 @@ MEM_GB="${MEM_GB:-6}"
 BOOT_GB="${BOOT_GB:-50}"
 DISPLAY_NAME="${DISPLAY_NAME:-free-$(date +%m%d)}"
 
-MIN_SLEEP="${MIN_SLEEP:-45}"              # below ~30s Oracle starts returning 429
-MAX_SLEEP="${MAX_SLEEP:-75}"
+# ~7 minutes with jitter. This is deliberately slow: Oracle rate-limits below
+# ~30s, but the bigger risk is cumulative volume. Accounts have been flagged and
+# had service limits zeroed after weeks of polling, at intervals as gentle as
+# 10 minutes -- see mohankumarpaluru/oracle-freetier-instance-creation#75.
+# Prefer bounded runs (MAX_TRIES) over leaving this going for days.
+MIN_SLEEP="${MIN_SLEEP:-390}"
+MAX_SLEEP="${MAX_SLEEP:-450}"
 MAX_TRIES="${MAX_TRIES:-0}"               # 0 = forever
-ON_SUCCESS="${ON_SUCCESS:-}"              # e.g. 'curl -d "got it" ntfy.sh/my-topic'
+ON_SUCCESS="${ON_SUCCESS:-}"              # arbitrary shell, run on success
+DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"    # Discord channel webhook URL
 
 # ------------------------------------------------------------------ utils
+
+json_escape() {                             # make $1 safe inside a JSON string
+  local v=$1
+  v=${v//\\/\\\\}; v=${v//\"/\\\"}; v=${v//$'\r'/}
+  v=${v//$'\n'/\\n}; v=${v//$'\t'/\\t}
+  printf '%s' "$v"
+}
+
+discord() {                                # $1 = message text
+  [[ -n $DISCORD_WEBHOOK ]] || return 0
+  if curl -fsS -m 20 -H 'Content-Type: application/json' \
+       -d "{\"content\":\"$(json_escape "$1")\"}" "$DISCORD_WEBHOOK" >/dev/null 2>&1; then
+    info "discord notified"
+  else
+    warn "discord notification failed -- check DISCORD_WEBHOOK"
+  fi
+}
 
 ts()   { date '+%H:%M:%S'; }
 info() { printf '\033[34m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
@@ -147,13 +170,37 @@ cmd_run() {
 
     if [[ $rc -eq 0 ]]; then
       ok "INSTANCE CREATED in $ad after $tries attempt(s)"
-      echo "$out" | grep -E '"(id|display-name|lifecycle-state)"' || echo "$out"
       printf '\a'
+      local iid ip=""
+      # tolerate any spacing around the colon; the CLI pretty-prints but a
+      # compact body would otherwise slip past and leave the OCID empty
+      iid=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\(ocid1\.instance[^"]*\)".*/\1/p' <<<"$out" | head -1)
+      [[ -n $iid ]] || warn "could not parse the instance OCID from the response"
+
+      # the VNIC (and its public IP) is attached a little after the instance
+      info "waiting for the public IP to be assigned..."
+      local n
+      for n in 1 2 3 4 5 6 7 8 9 10; do
+        ip=$(oci compute instance list-vnics --instance-id "$iid" \
+             --query 'data[0]."public-ip"' --raw-output 2>/dev/null | tr -d '"[:space:]')
+        [[ -n $ip && $ip != null ]] && break
+        ip=""; sleep 6
+      done
+      [[ -n $ip ]] || ip="(not assigned yet -- check the console)"
+
+      ok "id:        $iid"
+      ok "public ip: $ip"
+      ok "ssh:       ssh -i ~/.ssh/oci_arm ubuntu@$ip"
+
+      discord ":white_check_mark: **OCI instance created**
+name: ${DISPLAY_NAME}
+where: ${ad}
+shape: ${SHAPE} ${OCPUS} OCPU / ${MEM_GB} GB
+after: ${tries} attempt(s), ${misses} capacity misses
+public ip: ${ip}
+\`ssh -i ~/.ssh/oci_arm ubuntu@${ip}\`"
+
       [[ -n $ON_SUCCESS ]] && eval "$ON_SUCCESS"
-      info "public IP (may take ~30s to appear):"
-      oci compute instance list-vnics --instance-id \
-        "$(sed -n 's/.*"id": "\(ocid1\.instance[^"]*\)".*/\1/p' <<<"$out" | head -1)" \
-        --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true
       return 0
     fi
 
@@ -164,9 +211,11 @@ cmd_run() {
       backoff=$(( backoff * 2 )); (( backoff > 8 )) && backoff=8
       warn "rate limited -- backing off ${backoff}x"
     elif grep -qiE 'limitexceeded|quota|service limit' <<<"$out"; then
+      discord ":octagonal_sign: OCI grabber stopped: service limit / quota exceeded after ${tries} attempts."
       die "quota exceeded -- you already hold your Always Free allowance. Terminate an old instance first."
     elif grep -qiE 'notauthorized|notfound|invalidparameter|cannotparserequest' <<<"$out"; then
       printf '%s\n' "$out" >&2
+      discord ":warning: OCI grabber stopped after ${tries} attempts: request rejected (bad OCID, permissions, or malformed request). Not a capacity problem."
       die "config error (bad OCID / permissions). Retrying will not help -- re-run: $0 discover"
     else
       warn "unrecognised error:"
@@ -175,6 +224,7 @@ cmd_run() {
     fi
 
     if (( MAX_TRIES > 0 && tries >= MAX_TRIES )); then
+      discord ":hourglass: OCI grabber finished ${tries} attempts (${misses} capacity misses) without landing an instance."
       die "gave up after $tries attempts"
     fi
 
