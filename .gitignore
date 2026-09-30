@@ -1,0 +1,8 @@
+oci_grab.json
+.oci_grab/
+*.log
+.venv/
+__pycache__/
+*.pem
+id_rsa*
+oci_config

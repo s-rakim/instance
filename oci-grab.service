@@ -1,0 +1,34 @@
+# systemd unit for mohankumarpaluru/oracle-freetier-instance-creation.
+# Replaces `./setup_init.sh`, which backgrounds main.py with a bare `&` and dies
+# with your SSH session. This survives logout, reboots, and crashes.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp oci-grab.service ~/.config/systemd/user/
+#   # edit WorkingDirectory below if you cloned somewhere else
+#   cd ~/oracle-freetier-instance-creation && python3 -m venv .venv \
+#       && .venv/bin/pip install -r requirements.txt
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now oci-grab
+#   loginctl enable-linger $USER        # keep running after you log out
+#
+#   journalctl --user -u oci-grab -f    # watch it
+#   systemctl --user stop oci-grab      # stop it
+
+[Unit]
+Description=Oracle free-tier instance grabber
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/oracle-freetier-instance-creation
+ExecStart=%h/oracle-freetier-instance-creation/.venv/bin/python main.py
+# main.py raises on any error it does not classify as retryable; restart instead
+# of ending the run 40 minutes before capacity opens up.
+Restart=always
+RestartSec=120
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
