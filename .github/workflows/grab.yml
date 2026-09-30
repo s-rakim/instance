@@ -83,8 +83,10 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
 
           mkdir -p ~/.oci
-          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
-          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.oci/id.pub
+          # Secrets copied from Windows carry CRLF. A trailing \r survives into
+          # the SSH key and the API rejects it, so strip CR on the way in.
+          printf '%s\n' "$OCI_KEY"        | tr -d '\r' > ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUBLIC_KEY" | tr -d '\r' > ~/.oci/id.pub
           chmod 600 ~/.oci/key.pem
           cat > ~/.oci/config <<EOF
           [DEFAULT]
@@ -101,6 +103,9 @@ jobs:
             || { echo "::error::OCI_KEY is not a PEM private key"; exit 1; }
           grep -q '^ssh-' ~/.oci/id.pub \
             || { echo "::error::SSH_PUBLIC_KEY is not an SSH public key (use the .pub)"; exit 1; }
+          # a multi-line value here means the private key was pasted by mistake
+          [ "$(wc -l < ~/.oci/id.pub)" -eq 1 ] \
+            || { echo "::error::SSH_PUBLIC_KEY has $(wc -l < ~/.oci/id.pub) lines; a public key is one line"; exit 1; }
 
       - name: Verify credentials before spending hours
         env:

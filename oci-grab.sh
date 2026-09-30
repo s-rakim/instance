@@ -215,7 +215,12 @@ public ip: ${ip}
       die "quota exceeded -- you already hold your Always Free allowance. Terminate an old instance first."
     elif grep -qiE 'notauthorized|notfound|invalidparameter|cannotparserequest' <<<"$out"; then
       printf '%s\n' "$out" >&2
-      discord ":warning: OCI grabber stopped after ${tries} attempts: request rejected (bad OCID, permissions, or malformed request). Not a capacity problem."
+      local why code
+      why=$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$out" | head -1)
+      code=$(sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$out" | head -1)
+      discord ":warning: OCI grabber stopped after ${tries} attempts.
+\`${code:-error}\`: ${why:-request rejected}
+Not a capacity problem -- retrying will not fix it."
       die "config error (bad OCID / permissions). Retrying will not help -- re-run: $0 discover"
     else
       warn "unrecognised error:"
