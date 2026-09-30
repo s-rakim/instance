@@ -72,9 +72,30 @@ cmd_discover() {
 
 ads=()
 load_ads() {
-  mapfile -t ads < <(oci iam availability-domain list \
-    --compartment-id "$COMPARTMENT_ID" --query 'data[].name' --raw-output | tr -d '\r')
-  ((${#ads[@]})) || die "could not list availability domains -- check COMPARTMENT_ID"
+  local raw
+  raw=$(oci iam availability-domain list \
+        --compartment-id "$COMPARTMENT_ID" --query 'data[].name' --raw-output 2>/dev/null) \
+    || die "could not list availability domains -- check COMPARTMENT_ID"
+
+  # --raw-output only unwraps a SCALAR. For a list it still prints JSON:
+  #   [
+  #     "LpqT:US-CHICAGO-1-AD-1",
+  #     "LpqT:US-CHICAGO-1-AD-2"
+  #   ]
+  # Reading that verbatim sends "[" as an availability domain and the service
+  # rejects the whole request with 400 CannotParseRequest. Extract the quoted
+  # names instead.
+  mapfile -t ads < <(sed -n 's/.*"\([^"]*\)".*/\1/p' <<<"$raw" | tr -d '\r')
+  if ((${#ads[@]} == 0)); then          # a CLI that ever returns bare lines
+    mapfile -t ads < <(tr -d '[],"\r' <<<"$raw" \
+                       | sed '/^[[:space:]]*$/d; s/^[[:space:]]*//; s/[[:space:]]*$//')
+  fi
+
+  local ad
+  for ad in "${ads[@]}"; do
+    [[ $ad == *:* ]] || die "parsed a bogus availability domain: '$ad' -- expected NAME:REGION-AD-n"
+  done
+  ((${#ads[@]})) || die "could not parse availability domains -- check COMPARTMENT_ID"
   info "availability domains in rotation: ${ads[*]}"
 }
 
