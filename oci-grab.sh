@@ -42,8 +42,14 @@ command -v oci >/dev/null || die "oci CLI not found -- install it first"
 # --------------------------------------------------------------- discover
 
 cmd_discover() {
-  local t; t=$(oci iam compartment list --all --query 'data[0]."compartment-id"' --raw-output 2>/dev/null) \
-    || die "oci CLI is not authenticated -- run 'oci setup config'"
+  # Cloud Shell exports OCI_TENANCY; deriving it from `compartment list` fails on
+  # a tenancy that has no sub-compartments, which is the common fresh-account case.
+  local t="${OCI_TENANCY:-}"
+  if [[ -z $t ]]; then
+    t=$(oci iam compartment list --all --query 'data[0]."compartment-id"' --raw-output 2>/dev/null) \
+      || die "oci CLI is not authenticated -- run 'oci setup config'"
+  fi
+  [[ -n $t && $t != null ]] || die "could not determine your tenancy OCID -- set OCI_TENANCY"
   echo
   echo "COMPARTMENT_ID=$t   # tenancy root; a sub-compartment works too"
   echo
@@ -73,19 +79,27 @@ load_ads() {
 }
 
 launch() {                                  # $1 = availability domain
+  # This minimal set is VERIFIED against the live API. Adding --assign-public-ip,
+  # --display-name or --boot-volume-size-in-gbs made the service answer 400
+  # CannotParseRequest; which one is at fault was never isolated. Each is opt-in
+  # below so you can add them back one at a time if you want to find out.
   local args=(
     --availability-domain "$1"
     --compartment-id "$COMPARTMENT_ID"
     --shape "$SHAPE"
     --image-id "$IMAGE_ID"
     --subnet-id "$SUBNET_ID"
-    --assign-public-ip true
-    --display-name "$DISPLAY_NAME"
-    --boot-volume-size-in-gbs "$BOOT_GB"
     --ssh-authorized-keys-file "$SSH_KEY"
   )
   # non-Flex shapes (e.g. VM.Standard.E2.1.Micro) reject --shape-config
   [[ $SHAPE == *.Flex ]] && args+=(--shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM_GB}")
+
+  # Opt-in extras. A public subnet already assigns a public IP by default, and a
+  # boot volume can be expanded after launch, so leaving these off costs little.
+  [[ -n ${WITH_DISPLAY_NAME:-} ]] && args+=(--display-name "$DISPLAY_NAME")
+  [[ -n ${WITH_PUBLIC_IP:-}    ]] && args+=(--assign-public-ip true)
+  [[ -n ${WITH_BOOT_GB:-}      ]] && args+=(--boot-volume-size-in-gbs "$BOOT_GB")
+
   oci compute instance launch "${args[@]}" 2>&1
 }
 
@@ -130,11 +144,13 @@ cmd_run() {
       warn "rate limited -- backing off ${backoff}x"
     elif grep -qiE 'limitexceeded|quota|service limit' <<<"$out"; then
       die "quota exceeded -- you already hold your Always Free allowance. Terminate an old instance first."
-    elif grep -qiE 'notauthorized|notfound|invalidparameter' <<<"$out"; then
+    elif grep -qiE 'notauthorized|notfound|invalidparameter|cannotparserequest' <<<"$out"; then
       printf '%s\n' "$out" >&2
       die "config error (bad OCID / permissions). Retrying will not help -- re-run: $0 discover"
     else
-      warn "unrecognised error:"; printf '%s\n' "$out" | head -5
+      warn "unrecognised error:"
+      # the "message" field is what actually says what went wrong -- surface it
+      grep -m1 '"message"' <<<"$out" || printf '%s\n' "$out" | head -20
     fi
 
     if (( MAX_TRIES > 0 && tries >= MAX_TRIES )); then
