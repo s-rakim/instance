@@ -148,6 +148,21 @@ launch() {                                  # $1 = availability domain
 }
 
 preflight() {
+  # Values pasted into a web form (GitHub secrets, workflow inputs) or copied
+  # from Windows can carry a trailing newline, CR or space. The API then answers
+  # 400 without naming the offending field, so strip it before we get there.
+  COMPARTMENT_ID=$(tr -d '[:space:]' <<<"$COMPARTMENT_ID")
+  SUBNET_ID=$(tr -d '[:space:]' <<<"$SUBNET_ID")
+  IMAGE_ID=$(tr -d '[:space:]' <<<"$IMAGE_ID")
+  SHAPE=$(tr -d '[:space:]' <<<"$SHAPE")
+  OCPUS=$(tr -d '[:space:]' <<<"$OCPUS")
+  MEM_GB=$(tr -d '[:space:]' <<<"$MEM_GB")
+  BOOT_GB=$(tr -d '[:space:]' <<<"$BOOT_GB")
+  DISPLAY_NAME=$(tr -d '\r\n' <<<"$DISPLAY_NAME")   # spaces are legal in a name
+
+  [[ $OCPUS =~ ^[0-9]+$ ]]  || die "OCPUS must be a whole number, got '$OCPUS'"
+  [[ $MEM_GB =~ ^[0-9]+$ ]] || die "MEM_GB must be a whole number, got '$MEM_GB'"
+
   [[ -n $COMPARTMENT_ID ]] || die "COMPARTMENT_ID is empty -- run: $0 discover"
   [[ -n $SUBNET_ID      ]] || die "SUBNET_ID is empty -- run: $0 discover"
   [[ -n $IMAGE_ID       ]] || die "IMAGE_ID is empty -- run: $0 discover"
@@ -166,6 +181,16 @@ cmd_run() {
   while :; do
     local ad="${ads[$(( i++ % ${#ads[@]} ))]}"
     tries=$((tries + 1))
+
+    if (( tries == 1 )); then     # square brackets make stray whitespace visible
+      info "request parameters:"
+      info "  ad      [$ad]"
+      info "  subnet  [$SUBNET_ID]"
+      info "  image   [$IMAGE_ID]"
+      info "  shape   [$SHAPE]  ocpus [$OCPUS]  memory [$MEM_GB]"
+      info "  sshkey  [$SSH_KEY] ($(wc -l <"$SSH_KEY" 2>/dev/null) line(s), $(wc -c <"$SSH_KEY" 2>/dev/null) bytes)"
+    fi
+
     out=$(launch "$ad"); rc=$?
 
     if [[ $rc -eq 0 ]]; then
