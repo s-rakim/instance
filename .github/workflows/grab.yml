@@ -1,0 +1,127 @@
+# One-shot, bounded hunt for an Always Free A1.Flex instance.
+#
+# Deliberately NOT on a schedule. A cron that polls indefinitely is the usage
+# pattern that has got Oracle accounts flagged and their service limits zeroed
+# (mohankumarpaluru/oracle-freetier-instance-creation#75). You start this by
+# hand, it makes max_tries attempts, tells Discord what happened, and stops.
+#
+# Run it: Actions -> "Grab OCI instance" -> Run workflow.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   OCI_KEY           contents of your API private key .pem
+#   OCI_USER_OCID     user=...        from your ~/.oci/config
+#   OCI_TENANCY_OCID  tenancy=...     from your ~/.oci/config
+#   OCI_FINGERPRINT   fingerprint=... from your ~/.oci/config
+#   OCI_REGION        e.g. us-chicago-1
+#   OCI_SUBNET_ID     a PUBLIC subnet OCID
+#   OCI_IMAGE_ID      an aarch64 image OCID
+#   SSH_PUBLIC_KEY    contents of oci_arm.pub (the .pub, not the private key)
+#   DISCORD_WEBHOOK   optional; omit for no notifications
+
+name: Grab OCI instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_tries:
+        description: "Attempts before giving up (~10 min each: API call + sleep)"
+        required: true
+        default: "30"
+      ocpus:
+        description: "OCPUs (1 lands far more often than 4)"
+        required: true
+        default: "1"
+      memory_gb:
+        description: "Memory in GB (6 pairs with 1 OCPU)"
+        required: true
+        default: "6"
+      display_name:
+        description: "Instance name"
+        required: true
+        default: "docker-host"
+
+permissions:
+  contents: read
+
+jobs:
+  grab:
+    runs-on: ubuntu-latest
+    # 6h is the GitHub-hosted ceiling. 30 tries lands around 5h, so this stops
+    # the job before GitHub kills it mid-attempt.
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Write OCI credentials
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for v in OCI_KEY OCI_USER_OCID OCI_TENANCY_OCID OCI_FINGERPRINT \
+                   OCI_REGION OCI_SUBNET_ID OCI_IMAGE_ID SSH_PUBLIC_KEY; do
+            if [ -z "${!v:-}" ]; then
+              echo "::error::repository secret $v is not set"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/.oci/id.pub
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+          # Fail loudly on a pasted-wrong secret rather than 5h of 401s.
+          grep -q 'BEGIN' ~/.oci/key.pem \
+            || { echo "::error::OCI_KEY is not a PEM private key"; exit 1; }
+          grep -q '^ssh-' ~/.oci/id.pub \
+            || { echo "::error::SSH_PUBLIC_KEY is not an SSH public key (use the .pub)"; exit 1; }
+
+      - name: Verify credentials before spending hours
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+        run: |
+          set -euo pipefail
+          echo "availability domains visible to these credentials:"
+          oci iam availability-domain list \
+            --compartment-id "$OCI_TENANCY_OCID" --query 'data[].name' --raw-output
+
+      - name: Hunt
+        env:
+          COMPARTMENT_ID: ${{ secrets.OCI_TENANCY_OCID }}
+          SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          MAX_TRIES: ${{ inputs.max_tries }}
+          OCPUS: ${{ inputs.ocpus }}
+          MEM_GB: ${{ inputs.memory_gb }}
+          DISPLAY_NAME: ${{ inputs.display_name }}
+          SSH_KEY: /home/runner/.oci/id.pub
+        run: |
+          chmod +x ./oci-grab.sh
+          ./oci-grab.sh run
