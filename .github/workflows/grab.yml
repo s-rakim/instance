@@ -83,10 +83,12 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
 
           mkdir -p ~/.oci
-          # Secrets copied from Windows carry CRLF. A trailing \r survives into
-          # the SSH key and the API rejects it, so strip CR on the way in.
-          printf '%s\n' "$OCI_KEY"        | tr -d '\r' > ~/.oci/key.pem
-          printf '%s\n' "$SSH_PUBLIC_KEY" | tr -d '\r' > ~/.oci/id.pub
+          # Secrets copied from Windows carry CRLF, and a value saved with its own
+          # trailing newline gains a second one from printf -- which left a blank
+          # line in id.pub that the API rejected as a malformed key entry.
+          # Strip CR, then drop blank lines so each file ends with exactly one \n.
+          printf '%s\n' "$OCI_KEY"        | tr -d '\r' | sed '/^[[:space:]]*$/d' > ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUBLIC_KEY" | tr -d '\r' | sed '/^[[:space:]]*$/d' > ~/.oci/id.pub
           chmod 600 ~/.oci/key.pem
           cat > ~/.oci/config <<EOF
           [DEFAULT]
