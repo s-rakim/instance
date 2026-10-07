@@ -24,7 +24,7 @@ on:
   workflow_dispatch:
     inputs:
       max_tries:
-        description: "Attempts before giving up (~10 min each: API call + sleep)"
+        description: "Attempts before giving up. MAX 35 -- each takes ~9 min and the job is capped at 350."
         required: true
         default: "30"
       ocpus:
@@ -51,6 +51,23 @@ jobs:
     timeout-minutes: 350
 
     steps:
+      - name: Check max_tries can finish inside the job timeout
+        env:
+          MAX_TRIES: ${{ inputs.max_tries }}
+        run: |
+          set -euo pipefail
+          # Measured: ~8.9 min per attempt (launch call + sleep). The job is
+          # capped at 350 min, so anything past ~39 is killed mid-run -- and a
+          # cancelled job never reaches the script's exit path, so no Discord.
+          case "$MAX_TRIES" in ''|*[!0-9]*) echo "::error::max_tries must be a whole number"; exit 1;; esac
+          if [ "$MAX_TRIES" -gt 35 ]; then
+            echo "::error::max_tries=$MAX_TRIES would need about $(( MAX_TRIES * 89 / 10 )) min."
+            echo "::error::The limit is 35, leaving headroom under the 350-minute job cap because capacity calls sometimes run long."
+            echo "::error::Use 35 or fewer and start the workflow again for more attempts."
+            exit 1
+          fi
+          echo "max_tries=$MAX_TRIES -> about $(( MAX_TRIES * 89 / 10 )) min, inside the 350 min cap."
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -119,6 +136,7 @@ jobs:
             --compartment-id "$OCI_TENANCY_OCID" --query 'data[].name' --raw-output
 
       - name: Hunt
+        id: hunt
         env:
           COMPARTMENT_ID: ${{ secrets.OCI_TENANCY_OCID }}
           SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
@@ -132,3 +150,15 @@ jobs:
         run: |
           chmod +x ./oci-grab.sh
           ./oci-grab.sh run
+
+      # A timed-out or cancelled job is killed mid-sleep, so the script never
+      # runs its own notification. Without this the run just goes quiet.
+      - name: Report a cancelled or timed-out run
+        if: always() && steps.hunt.outcome == 'cancelled'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          [ -n "${DISCORD_WEBHOOK:-}" ] || exit 0
+          curl -fsS -m 20 -H 'Content-Type: application/json' \
+            -d '{"content":":octagonal_sign: OCI grabber was cut off before it finished — almost certainly the 350-minute job cap. No instance. Start it again with max_tries at 35 or less."}' \
+            "$DISCORD_WEBHOOK" >/dev/null || true
