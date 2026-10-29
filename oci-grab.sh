@@ -93,6 +93,26 @@ cmd_discover() {
 
 # ----------------------------------------------------------------- launch
 
+already_landed() {                         # echoes the OCID if one exists
+  command -v python3 >/dev/null 2>&1 || { warn "python3 missing; skipping the already-landed check"; return 1; }
+  local json
+  json=$(oci compute instance list --compartment-id "$COMPARTMENT_ID" --all \
+         --output json 2>/dev/null) || return 1
+  python3 -I -c '
+import json, sys
+want = sys.argv[1]
+try:
+    rows = json.load(sys.stdin).get("data") or []
+except Exception:
+    sys.exit(2)
+for r in rows:
+    if r.get("display-name") == want and r.get("lifecycle-state") in ("RUNNING", "PROVISIONING", "STARTING"):
+        print(r.get("id", ""))
+        sys.exit(0)
+sys.exit(1)
+' "$DISPLAY_NAME" <<<"$json"
+}
+
 ads=()
 load_ads() {
   local raw
@@ -172,6 +192,17 @@ preflight() {
 
 cmd_run() {
   preflight
+
+  # On a schedule this runs over and over. Without this check it would keep
+  # hammering the API long after an instance landed -- and a launch whose
+  # response was lost could leave a second billable VM behind.
+  local have
+  if have=$(already_landed); then
+    ok "an instance named '$DISPLAY_NAME' already exists ($have) -- nothing to do"
+    discord ":white_check_mark: OCI grabber: \`${DISPLAY_NAME}\` already exists, so this run did nothing. The hunt is over -- you can turn the schedule off."
+    return 0
+  fi
+
   load_ads
 
   local tries=0 misses=0 backoff=1 i=0 out rc

@@ -21,6 +21,20 @@
 name: Grab OCI instance
 
 on:
+  # Runs until an instance lands, then every later run exits in seconds because
+  # the script checks first whether one already exists.
+  #
+  # Cadence vs. the account in oracle-freetier-instance-creation#75 that had its
+  # service limits zeroed (every 10 min for two months = ~144 attempts/day):
+  #   '0 */12 * * *'  ->  70 attempts/day   (half that rate)   <- default
+  #   '0 */8  * * *'  -> 105 attempts/day   (three quarters)
+  #   '0 */6  * * *'  -> 140 attempts/day   (the same rate)
+  # Change the line below to move between them.
+  #
+  # GitHub disables scheduled workflows after 60 days with no repo activity.
+  schedule:
+    - cron: '0 */12 * * *'
+
   workflow_dispatch:
     inputs:
       max_tries:
@@ -43,6 +57,12 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # A run lasts ~5.2h, so a delayed schedule could otherwise start a second one
+  # on top of the first and double the request rate.
+  group: oci-grab
+  cancel-in-progress: false
+
 jobs:
   grab:
     runs-on: ubuntu-latest
@@ -53,7 +73,7 @@ jobs:
     steps:
       - name: Check max_tries can finish inside the job timeout
         env:
-          MAX_TRIES: ${{ inputs.max_tries }}
+          MAX_TRIES: ${{ inputs.max_tries || '30' }}
         run: |
           set -euo pipefail
           # Measured: ~8.9 min per attempt (launch call + sleep). The job is
@@ -142,10 +162,10 @@ jobs:
           SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
           IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          MAX_TRIES: ${{ inputs.max_tries }}
-          OCPUS: ${{ inputs.ocpus }}
-          MEM_GB: ${{ inputs.memory_gb }}
-          DISPLAY_NAME: ${{ inputs.display_name }}
+          MAX_TRIES: ${{ inputs.max_tries || '30' }}
+          OCPUS: ${{ inputs.ocpus || '1' }}
+          MEM_GB: ${{ inputs.memory_gb || '6' }}
+          DISPLAY_NAME: ${{ inputs.display_name || 'docker-host' }}
           SSH_KEY: /home/runner/.oci/id.pub
         run: |
           chmod +x ./oci-grab.sh
