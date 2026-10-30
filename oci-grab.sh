@@ -34,6 +34,7 @@ MAX_SLEEP="${MAX_SLEEP:-450}"
 MAX_TRIES="${MAX_TRIES:-0}"               # 0 = forever
 ON_SUCCESS="${ON_SUCCESS:-}"              # arbitrary shell, run on success
 DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"    # Discord channel webhook URL
+NTFY_URL="${NTFY_URL:-}"                  # e.g. https://ntfy.sh/some-long-random-topic
 
 # ------------------------------------------------------------------ utils
 
@@ -44,14 +45,24 @@ json_escape() {                             # make $1 safe inside a JSON string
   printf '%s' "$v"
 }
 
-discord() {                                # $1 = message text
-  [[ -n $DISCORD_WEBHOOK ]] || return 0
-  if curl -fsS -m 20 -H 'Content-Type: application/json' \
-       -d "{\"content\":\"$(json_escape "$1")\"}" "$DISCORD_WEBHOOK" >/dev/null 2>&1; then
-    info "discord notified"
-  else
-    warn "discord notification failed -- check DISCORD_WEBHOOK"
+notify() {                                 # $1 = message text
+  if [[ -n $DISCORD_WEBHOOK ]]; then
+    if curl -fsS -m 20 -H 'Content-Type: application/json' \
+         -d "{\"content\":\"$(json_escape "$1")\"}" "$DISCORD_WEBHOOK" >/dev/null 2>&1; then
+      info "discord notified"
+    else
+      warn "discord notification failed -- check DISCORD_WEBHOOK"
+    fi
   fi
+  # ntfy pushes to the ntfy phone app; the body is sent as-is
+  if [[ -n $NTFY_URL ]]; then
+    if curl -fsS -m 20 -H 'Title: OCI grabber' --data-binary "$1" "$NTFY_URL" >/dev/null 2>&1; then
+      info "ntfy notified"
+    else
+      warn "ntfy notification failed -- check NTFY_URL"
+    fi
+  fi
+  return 0
 }
 
 ts()   { date '+%H:%M:%S'; }
@@ -59,8 +70,11 @@ info() { printf '\033[34m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
 ok()   { printf '\033[32m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
 warn() { printf '\033[33m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
 die()  { printf '\033[31m[%s]\033[0m %s\n'   "$(ts)" "$*" >&2; exit 1; }
+# exit 2 = retrying will not help (bad config, quota). hunt.sh stops on it and
+# restarts on a plain exit 1, which is usually the network blipping.
+fatal() { printf '\033[31m[%s]\033[0m %s\n'  "$(ts)" "$*" >&2; exit 2; }
 
-command -v oci >/dev/null || die "oci CLI not found -- install it first"
+command -v oci >/dev/null || fatal "oci CLI not found -- install it first"
 
 # --------------------------------------------------------------- discover
 
@@ -136,7 +150,7 @@ load_ads() {
 
   local ad
   for ad in "${ads[@]}"; do
-    [[ $ad == *:* ]] || die "parsed a bogus availability domain: '$ad' -- expected NAME:REGION-AD-n"
+    [[ $ad == *:* ]] || fatal "parsed a bogus availability domain: '$ad' -- expected NAME:REGION-AD-n"
   done
   ((${#ads[@]})) || die "could not parse availability domains -- check COMPARTMENT_ID"
   info "availability domains in rotation: ${ads[*]}"
@@ -180,14 +194,14 @@ preflight() {
   BOOT_GB=$(tr -d '[:space:]' <<<"$BOOT_GB")
   DISPLAY_NAME=$(tr -d '\r\n' <<<"$DISPLAY_NAME")   # spaces are legal in a name
 
-  [[ $OCPUS =~ ^[0-9]+$ ]]  || die "OCPUS must be a whole number, got '$OCPUS'"
-  [[ $MEM_GB =~ ^[0-9]+$ ]] || die "MEM_GB must be a whole number, got '$MEM_GB'"
+  [[ $OCPUS =~ ^[0-9]+$ ]]  || fatal "OCPUS must be a whole number, got '$OCPUS'"
+  [[ $MEM_GB =~ ^[0-9]+$ ]] || fatal "MEM_GB must be a whole number, got '$MEM_GB'"
 
-  [[ -n $COMPARTMENT_ID ]] || die "COMPARTMENT_ID is empty -- run: $0 discover"
-  [[ -n $SUBNET_ID      ]] || die "SUBNET_ID is empty -- run: $0 discover"
-  [[ -n $IMAGE_ID       ]] || die "IMAGE_ID is empty -- run: $0 discover"
-  [[ -r $SSH_KEY        ]] || die "SSH public key not readable: $SSH_KEY"
-  grep -q '^ssh-' "$SSH_KEY" || die "$SSH_KEY is not a public key (you want the .pub file)"
+  [[ -n $COMPARTMENT_ID ]] || fatal "COMPARTMENT_ID is empty -- run: $0 discover"
+  [[ -n $SUBNET_ID      ]] || fatal "SUBNET_ID is empty -- run: $0 discover"
+  [[ -n $IMAGE_ID       ]] || fatal "IMAGE_ID is empty -- run: $0 discover"
+  [[ -r $SSH_KEY        ]] || fatal "SSH public key not readable: $SSH_KEY"
+  grep -q '^ssh-' "$SSH_KEY" || fatal "$SSH_KEY is not a public key (you want the .pub file)"
 }
 
 cmd_run() {
@@ -199,7 +213,7 @@ cmd_run() {
   local have
   if have=$(already_landed); then
     ok "an instance named '$DISPLAY_NAME' already exists ($have) -- nothing to do"
-    discord ":white_check_mark: OCI grabber: \`${DISPLAY_NAME}\` already exists, so this run did nothing. The hunt is over -- you can turn the schedule off."
+    notify ":white_check_mark: OCI grabber: \`${DISPLAY_NAME}\` already exists, so this run did nothing. The hunt is over -- you can turn the schedule off."
     return 0
   fi
 
@@ -222,6 +236,7 @@ cmd_run() {
       info "  sshkey  [$SSH_KEY] ($(wc -l <"$SSH_KEY" 2>/dev/null) line(s), $(wc -c <"$SSH_KEY" 2>/dev/null) bytes)"
     fi
 
+    local t0=$SECONDS
     out=$(launch "$ad"); rc=$?
 
     if [[ $rc -eq 0 ]]; then
@@ -248,7 +263,7 @@ cmd_run() {
       ok "public ip: $ip"
       ok "ssh:       ssh -i ~/.ssh/oci_arm ubuntu@$ip"
 
-      discord ":white_check_mark: **OCI instance created**
+      notify ":white_check_mark: **OCI instance created**
 name: ${DISPLAY_NAME}
 where: ${ad}
 shape: ${SHAPE} ${OCPUS} OCPU / ${MEM_GB} GB
@@ -267,17 +282,17 @@ public ip: ${ip}
       backoff=$(( backoff * 2 )); (( backoff > 8 )) && backoff=8
       warn "rate limited -- backing off ${backoff}x"
     elif grep -qiE 'limitexceeded|quota|service limit' <<<"$out"; then
-      discord ":octagonal_sign: OCI grabber stopped: service limit / quota exceeded after ${tries} attempts."
-      die "quota exceeded -- you already hold your Always Free allowance. Terminate an old instance first."
+      notify ":octagonal_sign: OCI grabber stopped: service limit / quota exceeded after ${tries} attempts."
+      fatal "quota exceeded -- you already hold your Always Free allowance. Terminate an old instance first."
     elif grep -qiE 'notauthorized|notfound|invalidparameter|cannotparserequest' <<<"$out"; then
       printf '%s\n' "$out" >&2
       local why code
       why=$(sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$out" | head -1)
       code=$(sed -n 's/.*"code"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$out" | head -1)
-      discord ":warning: OCI grabber stopped after ${tries} attempts.
+      notify ":warning: OCI grabber stopped after ${tries} attempts.
 \`${code:-error}\`: ${why:-request rejected}
 Not a capacity problem -- retrying will not fix it."
-      die "config error (bad OCID / permissions). Retrying will not help -- re-run: $0 discover"
+      fatal "config error (bad OCID / permissions). Retrying will not help -- re-run: $0 discover"
     else
       warn "unrecognised error:"
       # the "message" field is what actually says what went wrong -- surface it
@@ -285,11 +300,14 @@ Not a capacity problem -- retrying will not fix it."
     fi
 
     if (( MAX_TRIES > 0 && tries >= MAX_TRIES )); then
-      discord ":hourglass: OCI grabber finished ${tries} attempts (${misses} capacity misses) without landing an instance."
+      notify ":hourglass: OCI grabber finished ${tries} attempts (${misses} capacity misses) without landing an instance."
       die "gave up after $tries attempts"
     fi
 
     local nap=$(( (RANDOM % (MAX_SLEEP - MIN_SLEEP + 1) + MIN_SLEEP) * backoff ))
+    # count the interval from the start of the attempt, so 480 means one
+    # attempt every 8 minutes rather than 8 minutes plus however long OCI took
+    nap=$(( nap - (SECONDS - t0) )); (( nap < 1 )) && nap=1
     info "attempt $tries done ($misses capacity misses). sleeping ${nap}s"
     sleep "$nap"
   done

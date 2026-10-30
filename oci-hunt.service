@@ -1,0 +1,33 @@
+# systemd user unit for hunt.sh: keeps the 8-minute hunt going through logout
+# and reboots, and lets it stop for good once an instance lands.
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp oci-hunt.service ~/.config/systemd/user/
+#   # edit the paths below if you cloned somewhere other than ~/instance
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now oci-hunt
+#   loginctl enable-linger $USER        # keep running after you log out
+#
+#   journalctl --user -u oci-hunt -f    # watch it
+#   systemctl --user stop oci-hunt      # stop it
+
+[Unit]
+Description=Hunt for an Oracle free-tier instance every 8 minutes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/instance
+ExecStart=%h/instance/hunt.sh
+# the oci CLI installer puts itself in ~/bin, which systemd does not search
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# exit 0 = landed, exit 2 = bad config or quota: both mean stop, not restart
+Restart=on-failure
+RestartPreventExitStatus=2
+RestartSec=480
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

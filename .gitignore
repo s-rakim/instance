@@ -6,3 +6,5 @@ __pycache__/
 *.pem
 id_rsa*
 oci_config
+hunt.env
+.hunt-landed

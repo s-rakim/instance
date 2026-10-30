@@ -7,13 +7,50 @@ Tooling for grabbing an Oracle Cloud Always Free ARM instance
 
 | File | What it is |
 |---|---|
+| `hunt.sh` | Tries every 8 minutes, forever, until an instance lands, then stops and notifies you. Wraps `oci-grab.sh`. |
+| `oci-hunt.service` | systemd user unit for `hunt.sh`, so the hunt survives logout and reboots. |
 | `oci_grab.py` | Standalone retry daemon. `start`/`stop`/`status`/`logs`, jittered polling, exponential backoff on HTTP 429, duplicate-instance guard. Needs `pip install oci`. |
 | `oci-grab.sh` | Same idea as a shell loop over the `oci` CLI, if you'd rather not use the SDK. |
 | `oci-grab.user.js` | Browser-console/Tampermonkey fallback that re-clicks **Create** on the console form. Last resort. |
 | `oci-grab.service` | systemd user unit, so a run survives logout and reboots. |
 | `smaller-shape.patch` | Fix for the upstream project — see below. |
 
-## Quick start
+## Hunt every 8 minutes until it lands
+
+Run this on a machine that's always on. It needs the `oci` CLI with a working
+`oci setup config`.
+
+```sh
+git clone https://github.com/s-rakim/instance ~/instance && cd ~/instance
+./oci-grab.sh discover            # prints COMPARTMENT_ID, subnets, image
+cp hunt.env.example hunt.env      # paste the OCIDs in, set NTFY_URL
+./hunt.sh                         # watch the first attempt or two, then Ctrl-C
+
+mkdir -p ~/.config/systemd/user && cp oci-hunt.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now oci-hunt
+loginctl enable-linger $USER
+journalctl --user -u oci-hunt -f  # follow it
+```
+
+It makes one launch attempt every 8 minutes (`INTERVAL=480`), rotating through
+your availability domains, and keeps going through capacity misses, rate limits,
+network drops and OCI 500s. It stops on its own when:
+
+- **an instance lands**: you get a notification with the public IP and the ssh
+  command, and `.hunt-landed` is written so a restart won't launch a second one;
+- **retrying can't help**: a bad OCID, missing permissions, or a used-up Always
+  Free quota. You get a notification for those too.
+
+For phone notifications, install the [ntfy](https://ntfy.sh) app, subscribe to a
+long random topic name, and set `NTFY_URL=https://ntfy.sh/<that-topic>` in
+`hunt.env`. `DISCORD_WEBHOOK` works as well; set either or both.
+
+Every 8 minutes is 180 attempts a day, which is above the ~144/day of the account
+in oracle-freetier-instance-creation#75 that had its limits zeroed. Raise
+`INTERVAL` if that worries you; upgrading to Pay As You Go (below) usually makes
+the wait much shorter anyway.
+
+## Quick start (`oci_grab.py`)
 
 ```sh
 pip install oci
