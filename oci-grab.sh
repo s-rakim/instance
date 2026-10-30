@@ -32,6 +32,11 @@ DISPLAY_NAME="${DISPLAY_NAME:-free-$(date +%m%d)}"
 MIN_SLEEP="${MIN_SLEEP:-390}"
 MAX_SLEEP="${MAX_SLEEP:-450}"
 MAX_TRIES="${MAX_TRIES:-0}"               # 0 = forever
+# Launches without --display-name get an auto-generated name, so on a schedule
+# the name check above never matches. Set this to also stop when any running
+# instance of $SHAPE exists.
+STOP_IF_SHAPE_EXISTS="${STOP_IF_SHAPE_EXISTS:-}"
+NOTIFY_GIVEUP="${NOTIFY_GIVEUP:-1}"       # 0 = stay quiet when MAX_TRIES runs out
 ON_SUCCESS="${ON_SUCCESS:-}"              # arbitrary shell, run on success
 DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-}"    # Discord channel webhook URL
 NTFY_URL="${NTFY_URL:-}"                  # e.g. https://ntfy.sh/some-long-random-topic
@@ -70,8 +75,9 @@ info() { printf '\033[34m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
 ok()   { printf '\033[32m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
 warn() { printf '\033[33m[%s]\033[0m %s\n'   "$(ts)" "$*"; }
 die()  { printf '\033[31m[%s]\033[0m %s\n'   "$(ts)" "$*" >&2; exit 1; }
-# exit 2 = retrying will not help (bad config, quota). hunt.sh stops on it and
-# restarts on a plain exit 1, which is usually the network blipping.
+# exit 2 = retrying will not help (bad config, quota). hunt.sh and the workflow
+# stop on it, and start again on a plain exit 1 (usually the network blipping)
+# or on 3 (MAX_TRIES used up).
 fatal() { printf '\033[31m[%s]\033[0m %s\n'  "$(ts)" "$*" >&2; exit 2; }
 
 command -v oci >/dev/null || fatal "oci CLI not found -- install it first"
@@ -115,16 +121,19 @@ already_landed() {                         # echoes the OCID if one exists
   python3 -I -c '
 import json, sys
 want = sys.argv[1]
+shape = sys.argv[2]       # set: any live instance of this shape also counts
 try:
     rows = json.load(sys.stdin).get("data") or []
 except Exception:
     sys.exit(2)
 for r in rows:
-    if r.get("display-name") == want and r.get("lifecycle-state") in ("RUNNING", "PROVISIONING", "STARTING"):
+    if r.get("lifecycle-state") not in ("RUNNING", "PROVISIONING", "STARTING"):
+        continue
+    if r.get("display-name") == want or (shape and r.get("shape") == shape):
         print(r.get("id", ""))
         sys.exit(0)
 sys.exit(1)
-' "$DISPLAY_NAME" <<<"$json"
+' "$DISPLAY_NAME" "${STOP_IF_SHAPE_EXISTS:+$SHAPE}" <<<"$json"
 }
 
 ads=()
@@ -212,8 +221,8 @@ cmd_run() {
   # response was lost could leave a second billable VM behind.
   local have
   if have=$(already_landed); then
-    ok "an instance named '$DISPLAY_NAME' already exists ($have) -- nothing to do"
-    notify ":white_check_mark: OCI grabber: \`${DISPLAY_NAME}\` already exists, so this run did nothing. The hunt is over -- you can turn the schedule off."
+    ok "an instance already exists ($have) -- nothing to do"
+    notify ":white_check_mark: OCI grabber: an instance already exists (${have}), so this run did nothing. The hunt is over -- you can disable the workflow."
     return 0
   fi
 
@@ -300,8 +309,9 @@ Not a capacity problem -- retrying will not fix it."
     fi
 
     if (( MAX_TRIES > 0 && tries >= MAX_TRIES )); then
-      notify ":hourglass: OCI grabber finished ${tries} attempts (${misses} capacity misses) without landing an instance."
-      die "gave up after $tries attempts"
+      [[ $NOTIFY_GIVEUP == 1 ]] && notify ":hourglass: OCI grabber finished ${tries} attempts (${misses} capacity misses) without landing an instance."
+      warn "gave up after $tries attempts"
+      exit 3                              # 3 = out of tries, a fresh run may still land one
     fi
 
     local nap=$(( (RANDOM % (MAX_SLEEP - MIN_SLEEP + 1) + MIN_SLEEP) * backoff ))

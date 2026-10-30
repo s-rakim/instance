@@ -15,7 +15,23 @@ Tooling for grabbing an Oracle Cloud Always Free ARM instance
 | `oci-grab.service` | systemd user unit, so a run survives logout and reboots. |
 | `smaller-shape.patch` | Fix for the upstream project — see below. |
 
-## Hunt every 8 minutes until it lands
+## Hunt every 8 minutes, no machine needed (GitHub Actions)
+
+`.github/workflows/grab.yml` makes one attempt every 8 minutes, around the
+clock, until an instance lands. Each run does 40 attempts (~5h20m, under the
+6-hour job limit) and then starts the next run itself. It stops, and notifies
+you, when an instance exists or when retrying can't help.
+
+1. Add the secrets listed at the top of the workflow (Settings -> Secrets and
+   variables -> Actions). `NTFY_URL` and `DISCORD_WEBHOOK` are optional.
+2. Actions -> **Grab OCI instance** -> **Run workflow**.
+3. To stop early, **Disable workflow** from the same page. Cancelling a run
+   isn't enough, because the next one starts by itself.
+
+Actions minutes are free for public repos. Keep this repo public, or the
+hunt will use up a private repo's monthly allowance in a few days.
+
+## Hunt every 8 minutes on your own machine
 
 Run this on a machine that's always on. It needs the `oci` CLI with a working
 `oci setup config`.

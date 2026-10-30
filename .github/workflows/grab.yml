@@ -1,11 +1,15 @@
-# One-shot, bounded hunt for an Always Free A1.Flex instance.
+# Hunts for an Always Free A1.Flex instance every 8 minutes, around the clock,
+# until one lands. No machine of your own needed.
 #
-# Deliberately NOT on a schedule. A cron that polls indefinitely is the usage
-# pattern that has got Oracle accounts flagged and their service limits zeroed
-# (mohankumarpaluru/oracle-freetier-instance-creation#75). You start this by
-# hand, it makes max_tries attempts, tells Discord what happened, and stops.
+# A job can only last 6 hours, so each run makes up to 40 attempts (~5h20m)
+# and then starts the next run itself. The chain stops when an instance lands
+# or when retrying can't help (bad OCID, used-up quota), and tells you either
+# way. The schedule below only restarts the chain if it ever breaks; once an
+# instance exists, those runs see it and exit in seconds.
 #
-# Run it: Actions -> "Grab OCI instance" -> Run workflow.
+# Start it: Actions -> "Grab OCI instance" -> Run workflow.
+# Stop it:  Actions -> "Grab OCI instance" -> "..." -> Disable workflow.
+#           (Cancelling a run is not enough: the next run starts by itself.)
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   OCI_KEY           contents of your API private key .pem
@@ -16,31 +20,24 @@
 #   OCI_SUBNET_ID     a PUBLIC subnet OCID
 #   OCI_IMAGE_ID      an aarch64 image OCID
 #   SSH_PUBLIC_KEY    contents of oci_arm.pub (the .pub, not the private key)
-#   DISCORD_WEBHOOK   optional; omit for no notifications
+#   DISCORD_WEBHOOK   optional, Discord notifications
+#   NTFY_URL          optional, phone push via the ntfy app (https://ntfy.sh/<topic>)
 
 name: Grab OCI instance
 
 on:
-  # Runs until an instance lands, then every later run exits in seconds because
-  # the script checks first whether one already exists.
-  #
-  # Cadence vs. the account in oracle-freetier-instance-creation#75 that had its
-  # service limits zeroed (every 10 min for two months = ~144 attempts/day):
-  #   '0 */12 * * *'  ->  70 attempts/day   (half that rate)   <- default
-  #   '0 */8  * * *'  -> 105 attempts/day   (three quarters)
-  #   '0 */6  * * *'  -> 140 attempts/day   (the same rate)
-  # Change the line below to move between them.
-  #
-  # GitHub disables scheduled workflows after 60 days with no repo activity.
+  # Backstop only: restarts the chain if a run was lost. GitHub disables
+  # scheduled triggers after 60 days with no repo activity; the chain itself
+  # keeps going regardless.
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '17 */6 * * *'
 
   workflow_dispatch:
     inputs:
       max_tries:
-        description: "Attempts before giving up. MAX 35 -- each takes ~9 min and the job is capped at 350."
+        description: "Attempts per run before handing over to the next run. MAX 42 (8 min each, 350 min job cap)."
         required: true
-        default: "30"
+        default: "40"
       ocpus:
         description: "OCPUs (1 lands far more often than 4)"
         required: true
@@ -56,10 +53,11 @@ on:
 
 permissions:
   contents: read
+  actions: write      # lets a run start the next one
 
 concurrency:
-  # A run lasts ~5.2h, so a delayed schedule could otherwise start a second one
-  # on top of the first and double the request rate.
+  # Only one run at a time, so the backstop schedule queues behind the chain
+  # instead of doubling the request rate.
   group: oci-grab
   cancel-in-progress: false
 
@@ -73,20 +71,17 @@ jobs:
     steps:
       - name: Check max_tries can finish inside the job timeout
         env:
-          MAX_TRIES: ${{ inputs.max_tries || '30' }}
+          MAX_TRIES: ${{ inputs.max_tries || '40' }}
         run: |
           set -euo pipefail
-          # Measured: ~8.9 min per attempt (launch call + sleep). The job is
-          # capped at 350 min, so anything past ~39 is killed mid-run -- and a
-          # cancelled job never reaches the script's exit path, so no Discord.
+          # One attempt starts every 8 minutes. The job is capped at 350 min,
+          # and a cancelled job never reaches the script's exit path.
           case "$MAX_TRIES" in ''|*[!0-9]*) echo "::error::max_tries must be a whole number"; exit 1;; esac
-          if [ "$MAX_TRIES" -gt 35 ]; then
-            echo "::error::max_tries=$MAX_TRIES would need about $(( MAX_TRIES * 89 / 10 )) min."
-            echo "::error::The limit is 35, leaving headroom under the 350-minute job cap because capacity calls sometimes run long."
-            echo "::error::Use 35 or fewer and start the workflow again for more attempts."
+          if [ "$MAX_TRIES" -gt 42 ]; then
+            echo "::error::max_tries=$MAX_TRIES would need about $(( MAX_TRIES * 8 )) min; the limit is 42."
             exit 1
           fi
-          echo "max_tries=$MAX_TRIES -> about $(( MAX_TRIES * 89 / 10 )) min, inside the 350 min cap."
+          echo "max_tries=$MAX_TRIES -> about $(( MAX_TRIES * 8 )) min, inside the 350 min cap."
 
       - uses: actions/checkout@v4
 
@@ -162,23 +157,36 @@ jobs:
           SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
           IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          MAX_TRIES: ${{ inputs.max_tries || '30' }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          MAX_TRIES: ${{ inputs.max_tries || '40' }}
           OCPUS: ${{ inputs.ocpus || '1' }}
           MEM_GB: ${{ inputs.memory_gb || '6' }}
           DISPLAY_NAME: ${{ inputs.display_name || 'docker-host' }}
           SSH_KEY: /home/runner/.oci/id.pub
+          MIN_SLEEP: "480"
+          MAX_SLEEP: "480"
+          STOP_IF_SHAPE_EXISTS: "1"
+          NOTIFY_GIVEUP: "0"     # a run running out of tries is routine here
         run: |
           chmod +x ./oci-grab.sh
-          ./oci-grab.sh run
+          rc=0; ./oci-grab.sh run || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0) echo "Instance exists. The chain stops here." ;;
+            2) echo "::error::Stopped: retrying will not fix this (see above)."; exit 2 ;;
+            *) echo "No instance yet (exit $rc). The next run picks up." ;;
+          esac
 
-      # A timed-out or cancelled job is killed mid-sleep, so the script never
-      # runs its own notification. Without this the run just goes quiet.
-      - name: Report a cancelled or timed-out run
-        if: always() && steps.hunt.outcome == 'cancelled'
+      # Hand over to a fresh run, unless an instance landed or the config is
+      # broken. Also covers a run killed by the job cap or cancelled by GitHub.
+      - name: Start the next run
+        if: always() && (steps.hunt.outcome == 'cancelled' || (steps.hunt.outputs.rc != '' && steps.hunt.outputs.rc != '0' && steps.hunt.outputs.rc != '2'))
         env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          [ -n "${DISCORD_WEBHOOK:-}" ] || exit 0
-          curl -fsS -m 20 -H 'Content-Type: application/json' \
-            -d '{"content":":octagonal_sign: OCI grabber was cut off before it finished — almost certainly the 350-minute job cap. No instance. Start it again with max_tries at 35 or less."}' \
-            "$DISCORD_WEBHOOK" >/dev/null || true
+          gh workflow run grab.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f max_tries="${{ inputs.max_tries || '40' }}" \
+            -f ocpus="${{ inputs.ocpus || '1' }}" \
+            -f memory_gb="${{ inputs.memory_gb || '6' }}" \
+            -f display_name="${{ inputs.display_name || 'docker-host' }}"
+          echo "Next run queued."
