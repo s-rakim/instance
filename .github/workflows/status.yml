@@ -1,0 +1,128 @@
+# Daily status report to Discord: did it land, or not yet.
+#
+# Deliberately separate from grab.yml. A heartbeat built into the hunt can only
+# tell you the chain is alive -- if the chain dies, the heartbeat dies with it
+# and you hear nothing, which is the same silence as "no capacity yet". This
+# runs on its own schedule and reports what is actually true in Oracle, so
+# silence from it means something is genuinely wrong.
+#
+# It also exercises the webhook every day, so a rotated or dead URL shows up
+# within 24 hours instead of at the moment you miss the landing message.
+
+name: Daily status
+
+on:
+  schedule:
+    - cron: '0 9 * * *'      # 09:00 UTC daily
+  workflow_dispatch:          # or run it now, to test the webhook
+
+permissions:
+  contents: read
+  actions: read               # to count how many hunt runs there have been
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Write OCI credentials
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" | tr -d '\r' | sed '/^[[:space:]]*$/d' > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+
+      - name: Report
+        env:
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          DISPLAY_NAME: ${{ vars.DISPLAY_NAME || 'docker-host' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          # Rough context: how much hunting has happened so far.
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/grab.yml/runs?per_page=1" \
+                 --jq '.total_count' 2>/dev/null) || runs=""
+          [ -n "$runs" ] && attempts=$(( runs * 40 )) || { runs="?"; attempts="?"; }
+
+          instances=$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" \
+                      --all --output json 2>/dev/null) || instances=""
+
+          found=""
+          if [ -n "$instances" ]; then
+            found=$(python3 -I -c '
+          import json, sys
+          want = sys.argv[1]
+          try:
+              rows = json.load(sys.stdin).get("data") or []
+          except Exception:
+              sys.exit(1)
+          for r in rows:
+              if r.get("display-name") == want and r.get("lifecycle-state") in ("RUNNING", "PROVISIONING", "STARTING"):
+                  print(r.get("lifecycle-state", "") + " " + r.get("id", ""))
+                  sys.exit(0)
+          sys.exit(1)
+          ' "$DISPLAY_NAME" <<<"$instances") || found=""
+          fi
+
+          if [ -z "$instances" ]; then
+            msg=$(printf '%s' ":warning: Daily status: could not reach Oracle to check. Credentials or the API may be having a bad day. Hunt runs so far: ${runs}.")
+          elif [ -n "$found" ]; then
+            state=${found%% *}
+            iid=${found#* }
+            ip=$(oci compute instance list-vnics --instance-id "$iid" \
+                 --compartment-id "$OCI_TENANCY_OCID" --output json 2>/dev/null \
+                 | python3 -I -c '
+          import json, sys
+          try:
+              rows = json.load(sys.stdin).get("data") or []
+          except Exception:
+              rows = []
+          print(next((r["public-ip"] for r in rows if r.get("public-ip")), "none yet"))
+          ') || ip="unknown"
+            msg=$(printf '%s\n%s\n%s\n%s' \
+                  ":white_check_mark: **Daily status: you have an instance.**" \
+                  "\`${DISPLAY_NAME}\` is ${state}" \
+                  "ip: ${ip}" \
+                  "The hunt is over -- you can disable the Grab OCI instance workflow.")
+          else
+            msg=$(printf '%s' ":hourglass_flowing_sand: Daily status: no instance yet. ${runs} hunt runs so far, roughly ${attempts} attempts at ~130/day. The chain is alive; you will hear the moment one lands.")
+          fi
+
+          echo "$msg"
+
+          if [ -z "${DISCORD_WEBHOOK:-}" ]; then
+            echo "::warning::DISCORD_WEBHOOK is not set; nothing was sent"
+            exit 0
+          fi
+          payload=$(python3 -I -c 'import json,sys; print(json.dumps({"content": sys.stdin.read()}))' <<<"$msg")
+          if curl -fsS -m 20 -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK" >/dev/null; then
+            echo "sent"
+          else
+            echo "::error::Discord post failed -- the webhook is probably dead, so you would also miss the landing message"
+            exit 1
+          fi
