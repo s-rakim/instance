@@ -24,7 +24,9 @@ if [[ -f $ENV_FILE ]]; then
   set +a
 fi
 
-INTERVAL="${INTERVAL:-480}"            # seconds between attempts: 8 minutes
+# 130 attempts/day. The launch call adds ~27s on top of the sleep, so a 638s
+# sleep gives a 665s cycle and 86400/665 = 130.
+INTERVAL="${INTERVAL:-638}"
 [[ $INTERVAL =~ ^[0-9]+$ ]] && (( INTERVAL >= 60 )) \
   || { echo "INTERVAL must be a whole number of seconds, 60 or more (got '$INTERVAL')" >&2; exit 2; }
 

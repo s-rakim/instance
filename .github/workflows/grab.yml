@@ -163,8 +163,11 @@ jobs:
           MEM_GB: ${{ inputs.memory_gb || '6' }}
           DISPLAY_NAME: ${{ inputs.display_name || 'docker-host' }}
           SSH_KEY: /home/runner/.oci/id.pub
-          MIN_SLEEP: "480"
-          MAX_SLEEP: "480"
+          # 130 attempts/day. Measured overhead is ~27s per attempt on top of
+          # the sleep (480 produced 507), so 638 average gives a 665s cycle:
+          # 86400/665 = 130. Jittered so attempts do not land on a fixed grid.
+          MIN_SLEEP: "620"
+          MAX_SLEEP: "655"
           STOP_IF_SHAPE_EXISTS: "1"
           NOTIFY_GIVEUP: "0"     # a run running out of tries is routine here
         run: |
@@ -179,6 +182,23 @@ jobs:
 
       # Hand over to a fresh run, unless an instance landed or the config is
       # broken. Also covers a run killed by the job cap or cancelled by GitHub.
+      # Give-ups are silent by design, so without this a dead webhook looks
+      # exactly like a hunt that has not landed yet. At ~3.25 runs/day every
+      # third run is roughly daily.
+      - name: Daily heartbeat
+        if: always() && steps.hunt.outputs.rc != '0'
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          [ -n "${DISCORD_WEBHOOK:-}" ] || { echo "no webhook configured"; exit 0; }
+          [ $(( RUN_NUMBER % 3 )) -eq 0 ] || { echo "not a heartbeat run"; exit 0; }
+          curl -fsS -m 20 -H 'Content-Type: application/json' \
+            -d '{"content":":hourglass_flowing_sand: Still hunting. No instance yet, chain is alive. You will get a message the moment one lands."}' \
+            "$DISCORD_WEBHOOK" >/dev/null \
+            && echo "heartbeat sent" \
+            || echo "::warning::heartbeat failed -- the webhook may be dead, so you would miss the landing message"
+
       - name: Start the next run
         if: always() && (steps.hunt.outcome == 'cancelled' || (steps.hunt.outputs.rc != '' && steps.hunt.outputs.rc != '0' && steps.hunt.outputs.rc != '2'))
         env:
