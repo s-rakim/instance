@@ -64,8 +64,11 @@ jobs:
         run: |
           set -uo pipefail
 
-          # Rough context: how much hunting has happened so far.
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/grab.yml/runs?per_page=1" \
+          # How much hunting has actually happened. Count only completed runs:
+          # the 6-hourly backstop schedule queues behind the chain and is
+          # displaced by the chain's next dispatch before it runs, so those
+          # cancelled runs did zero attempts and must not be counted.
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/grab.yml/runs?status=success&per_page=1" \
                  --jq '.total_count' 2>/dev/null) || runs=""
           [ -n "$runs" ] && attempts=$(( runs * 40 )) || { runs="?"; attempts="?"; }
 
