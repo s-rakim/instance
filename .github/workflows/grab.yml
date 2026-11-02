@@ -35,9 +35,9 @@ on:
   workflow_dispatch:
     inputs:
       max_tries:
-        description: "Attempts per run before handing over to the next run. MAX 42 (8 min each, 350 min job cap)."
+        description: "Attempts per run before handing over to the next run. At 11.1 min each, 28 fits the cap."
         required: true
-        default: "40"
+        default: "28"
       ocpus:
         description: "OCPUs (1 lands far more often than 4)"
         required: true
@@ -55,6 +55,14 @@ permissions:
   contents: read
   actions: write      # lets a run start the next one
 
+# Pacing lives here so the guard and the hunt cannot disagree: changing the
+# sleep automatically changes the attempt limit the guard enforces.
+env:
+  SLEEP_MIN: "620"          # 130 attempts/day: avg 638s sleep + ~27s call
+  SLEEP_MAX: "655"          #   = 664s cycle, and 86400/664 = 130
+  ATTEMPT_OVERHEAD: "27"    # measured: the launch call lands on top of the sleep
+  JOB_CAP_MIN: "350"        # matches timeout-minutes; GitHub's ceiling is 360
+
 concurrency:
   # Only one run at a time, so the backstop schedule queues behind the chain
   # instead of doubling the request rate.
@@ -71,17 +79,26 @@ jobs:
     steps:
       - name: Check max_tries can finish inside the job timeout
         env:
-          MAX_TRIES: ${{ inputs.max_tries || '40' }}
+          MAX_TRIES: ${{ inputs.max_tries || '28' }}
         run: |
           set -euo pipefail
-          # One attempt starts every 8 minutes. The job is capped at 350 min,
-          # and a cancelled job never reaches the script's exit path.
           case "$MAX_TRIES" in ''|*[!0-9]*) echo "::error::max_tries must be a whole number"; exit 1;; esac
-          if [ "$MAX_TRIES" -gt 42 ]; then
-            echo "::error::max_tries=$MAX_TRIES would need about $(( MAX_TRIES * 8 )) min; the limit is 42."
+
+          # Derive the limit from the pacing above rather than hardcoding it.
+          # A fixed "8 minutes" went stale the moment the sleep changed for
+          # 130/day, and every run then overran the cap instead of finishing.
+          cycle=$(( ( (SLEEP_MIN + SLEEP_MAX) / 2 ) + ATTEMPT_OVERHEAD ))
+          usable=$(( JOB_CAP_MIN * 60 * 9 / 10 ))      # 10% headroom for slow calls
+          limit=$(( usable / cycle ))
+          need=$(( MAX_TRIES * cycle / 60 ))
+
+          echo "cycle ${cycle}s/attempt -> at most $limit attempts inside ${JOB_CAP_MIN} min"
+          if [ "$MAX_TRIES" -gt "$limit" ]; then
+            echo "::error::max_tries=$MAX_TRIES needs about ${need} min but the cap is ${JOB_CAP_MIN}."
+            echo "::error::At this pace the limit is ${limit}. The chain starts another run, so a smaller number loses nothing."
             exit 1
           fi
-          echo "max_tries=$MAX_TRIES -> about $(( MAX_TRIES * 8 )) min, inside the 350 min cap."
+          echo "max_tries=$MAX_TRIES -> about ${need} min, inside the cap."
 
       - uses: actions/checkout@v4
 
@@ -158,7 +175,7 @@ jobs:
           IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           NTFY_URL: ${{ secrets.NTFY_URL }}
-          MAX_TRIES: ${{ inputs.max_tries || '40' }}
+          MAX_TRIES: ${{ inputs.max_tries || '28' }}
           OCPUS: ${{ inputs.ocpus || '1' }}
           MEM_GB: ${{ inputs.memory_gb || '6' }}
           DISPLAY_NAME: ${{ inputs.display_name || 'docker-host' }}
@@ -166,8 +183,8 @@ jobs:
           # 130 attempts/day. Measured overhead is ~27s per attempt on top of
           # the sleep (480 produced 507), so 638 average gives a 665s cycle:
           # 86400/665 = 130. Jittered so attempts do not land on a fixed grid.
-          MIN_SLEEP: "620"
-          MAX_SLEEP: "655"
+          MIN_SLEEP: ${{ env.SLEEP_MIN }}
+          MAX_SLEEP: ${{ env.SLEEP_MAX }}
           STOP_IF_SHAPE_EXISTS: "1"
           NOTIFY_GIVEUP: "0"     # a run running out of tries is routine here
         run: |
@@ -188,7 +205,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh workflow run grab.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
-            -f max_tries="${{ inputs.max_tries || '40' }}" \
+            -f max_tries="${{ inputs.max_tries || '28' }}" \
             -f ocpus="${{ inputs.ocpus || '1' }}" \
             -f memory_gb="${{ inputs.memory_gb || '6' }}" \
             -f display_name="${{ inputs.display_name || 'docker-host' }}"
