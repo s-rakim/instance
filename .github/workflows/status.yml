@@ -89,16 +89,24 @@ jobs:
             echo "credentials OK (availability domains reachable)"
           fi
 
+          # Judge success by the exit code, never by whether output came back.
+          # The CLI prints NOTHING for an empty list, so testing for empty
+          # output reported "cannot reach Oracle" on the perfectly normal
+          # "you have no instances yet".
           oci_err=""
+          reachable=1
           if ! instances=$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" \
                            --all --output json 2>&1); then
+            reachable=0
             oci_err=$(printf '%s' "$instances" | tr '\n' ' ' | cut -c1-300)
             echo "::error::instance list failed: $oci_err"
             instances=""
+          elif [ -z "$instances" ]; then
+            echo "instance list returned nothing: the compartment has no instances"
           fi
 
           found=""
-          if [ -n "$instances" ]; then
+          if [ "$reachable" -eq 1 ] && [ -n "$instances" ]; then
             found=$(python3 -I -c '
           import json, sys
           want = sys.argv[1]
@@ -114,7 +122,7 @@ jobs:
           ' "$DISPLAY_NAME" <<<"$instances") || found=""
           fi
 
-          if [ -z "$instances" ]; then
+          if [ "$reachable" -eq 0 ]; then
             reason="${oci_err:-${probe_err:-no detail}}"
             msg=$(printf '%s\n%s' \
                   ":warning: Daily status: could not read your instances from Oracle. ${runs} hunt runs so far." \
