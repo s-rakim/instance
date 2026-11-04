@@ -42,6 +42,11 @@ jobs:
           OCI_REGION: ${{ secrets.OCI_REGION }}
         run: |
           set -euo pipefail
+          missing=0
+          for v in OCI_KEY OCI_USER_OCID OCI_TENANCY_OCID OCI_FINGERPRINT OCI_REGION; do
+            if [ -z "${!v:-}" ]; then echo "::error::repository secret $v is not set"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
           mkdir -p ~/.oci
           printf '%s\n' "$OCI_KEY" | tr -d '\r' | sed '/^[[:space:]]*$/d' > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
@@ -72,8 +77,25 @@ jobs:
                  --jq '.total_count' 2>/dev/null) || runs=""
           [ -n "$runs" ] && attempts=$(( runs * 40 )) || { runs="?"; attempts="?"; }
 
-          instances=$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" \
-                      --all --output json 2>/dev/null) || instances=""
+          # grab.yml makes this exact call successfully every run. If it fails
+          # here the credentials are wrong; if it works and the next one does
+          # not, the problem is the instance-list call itself.
+          probe_err=""
+          if ! probe=$(oci iam availability-domain list --compartment-id "$OCI_TENANCY_OCID" \
+                       --query 'data[].name' --raw-output 2>&1); then
+            probe_err=$(printf '%s' "$probe" | tr '\n' ' ' | cut -c1-300)
+            echo "::error::availability-domain list failed: $probe_err"
+          else
+            echo "credentials OK (availability domains reachable)"
+          fi
+
+          oci_err=""
+          if ! instances=$(oci compute instance list --compartment-id "$OCI_TENANCY_OCID" \
+                           --all --output json 2>&1); then
+            oci_err=$(printf '%s' "$instances" | tr '\n' ' ' | cut -c1-300)
+            echo "::error::instance list failed: $oci_err"
+            instances=""
+          fi
 
           found=""
           if [ -n "$instances" ]; then
@@ -93,7 +115,10 @@ jobs:
           fi
 
           if [ -z "$instances" ]; then
-            msg=$(printf '%s' ":warning: Daily status: could not reach Oracle to check. Credentials or the API may be having a bad day. Hunt runs so far: ${runs}.")
+            reason="${oci_err:-${probe_err:-no detail}}"
+            msg=$(printf '%s\n%s' \
+                  ":warning: Daily status: could not read your instances from Oracle. ${runs} hunt runs so far." \
+                  "\`${reason}\`")
           elif [ -n "$found" ]; then
             state=${found%% *}
             iid=${found#* }
